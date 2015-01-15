@@ -41,15 +41,20 @@ func loadGerritOrigin() {
 	}
 
 	// Gerrit must be set as Git's origin remote.
-	origin := getOutput("git", "config", "remote.origin.url")
+	origin := getOutput("git", "config", "remote.origin.pushurl")
+	if origin == "" {
+		origin = getOutput("git", "config", "remote.origin.url")
+	}
 
 	if strings.Contains(origin, "//github.com/") {
 		dief("git origin must be a Gerrit host, not GitHub: %s", origin)
 	}
 
 	if !strings.HasPrefix(origin, "https://") {
-		dief("git origin must be an https:// URL: %s", origin)
+		printf("git origin not https, some features will be unavailable")
+		return
 	}
+
 	// https:// prefix and then one slash between host and top-level name
 	if strings.Count(origin, "/") != 3 {
 		dief("git origin is malformed: %s", origin)
