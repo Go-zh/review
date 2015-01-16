@@ -7,7 +7,7 @@
 // Command git-codereview provides a simple command-line user interface for
 // working with git repositories and the Gerrit code review system.
 // See "git-codereview help" for details.
-package main // import "golang.org/x/review/git-codereview"
+package main // import "github.com/Go-zh/review/git-codereview"
 
 import (
 	"bytes"
