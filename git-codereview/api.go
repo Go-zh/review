@@ -41,8 +41,8 @@ func loadGerritOrigin() {
 	}
 
 	// Gerrit must be set as Git's origin remote.
-	origin := getOutput("git", "config", "remote.origin.pushurl")
-	if origin == "" {
+	origin, err := getOutputErr("git", "config", "remote.origin.pushurl")
+	if err != nil || origin == "" {
 		origin = getOutput("git", "config", "remote.origin.url")
 	}
 
