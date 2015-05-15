@@ -97,7 +97,9 @@ var oldHookScript = `#!/bin/sh
 exec git-review hook-invoke %s "$@"
 `
 
-func hookInvoke(args []string) {
+func cmdHookInvoke(args []string) {
+	flags.Parse(args)
+	args = flags.Args()
 	if len(args) == 0 {
 		dief("usage: git-codereview hook-invoke <hook-name> [args...]")
 	}
@@ -108,6 +110,8 @@ func hookInvoke(args []string) {
 		hookPreCommit(args[1:])
 	}
 }
+
+var issueRefRE = regexp.MustCompile(`(?P<space>\s)(?P<ref>#\d+\w)`)
 
 // hookCommitMsg is installed as the git commit-msg hook.
 // It adds a Change-Id line to the bottom of the commit message
@@ -136,9 +140,30 @@ func hookCommitMsg(args []string) {
 		dief("empty commit message")
 	}
 
+	// Insert a blank line between first line and subsequent lines if not present.
+	eol := bytes.IndexByte(data, '\n')
+	if eol != -1 && len(data) > eol+1 && data[eol+1] != '\n' {
+		data = append(data, 0)
+		copy(data[eol+1:], data[eol:])
+		data[eol+1] = '\n'
+	}
+
+	// Update issue references to point to issue repo, if set.
+	if issueRepo := config()["issuerepo"]; issueRepo != "" {
+		data = issueRefRE.ReplaceAll(data, []byte("${space}"+issueRepo+"${ref}"))
+	}
+
+	// Complain if two Change-Ids are present.
+	// This can happen during an interactive rebase;
+	// it is easy to forget to remove one of them.
+	nChangeId := bytes.Count(data, []byte("\nChange-Id: "))
+	if nChangeId > 1 {
+		dief("multiple Change-Id lines")
+	}
+
 	// Add Change-Id to commit message if not present.
 	edited := false
-	if !bytes.Contains(data, []byte("\nChange-Id: ")) {
+	if nChangeId == 0 {
 		edited = true
 		n := len(data)
 		for n > 0 && data[n-1] == '\n' {
@@ -151,11 +176,12 @@ func hookCommitMsg(args []string) {
 		data = append(data[:n], fmt.Sprintf("\n\nChange-Id: I%x\n", id[:])...)
 	}
 
-	// Add branch prefix to commit message if not present and not on master.
+	// Add branch prefix to commit message if not present and not on master
+	// and not a special Git fixup! or squash! commit message.
 	branch := strings.TrimPrefix(b.OriginBranch(), "origin/")
 	if branch != "master" {
 		prefix := "[" + branch + "] "
-		if !bytes.HasPrefix(data, []byte(prefix)) {
+		if !bytes.HasPrefix(data, []byte(prefix)) && !isFixup(data) {
 			edited = true
 			data = []byte(prefix + string(data))
 		}
@@ -167,6 +193,17 @@ func hookCommitMsg(args []string) {
 			dief("%v", err)
 		}
 	}
+}
+
+var (
+	fixupBang  = []byte("fixup!")
+	squashBang = []byte("squash!")
+)
+
+// isFixup reports whether text is a Git fixup! or squash! commit,
+// which must not have a prefix.
+func isFixup(text []byte) bool {
+	return bytes.HasPrefix(text, fixupBang) || bytes.HasPrefix(text, squashBang)
 }
 
 // stripComments strips lines that begin with "#".

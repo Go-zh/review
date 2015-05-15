@@ -6,14 +6,14 @@ package main
 
 import "strings"
 
-func doSync(args []string) {
+func cmdSync(args []string) {
 	expectZeroArgs(args, "sync")
 
 	// Get current branch and commit ID for fixup after pull.
 	b := CurrentBranch()
 	var id string
 	if work := b.Pending(); len(work) > 0 {
-		id = work[len(work)-1].ChangeID
+		id = work[0].ChangeID
 	}
 
 	// Don't sync with staged or unstaged changes.

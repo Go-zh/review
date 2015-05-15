@@ -12,10 +12,11 @@ import (
 	"strings"
 )
 
-func mail(args []string) {
+func cmdMail(args []string) {
 	var (
 		diff   = flags.Bool("diff", false, "show change commit diff and don't upload or mail")
 		force  = flags.Bool("f", false, "mail even if there are staged changes")
+		topic  = flags.String("topic", "", "set Gerrit topic")
 		rList  = new(stringList) // installed below
 		ccList = new(stringList) // installed below
 	)
@@ -23,7 +24,7 @@ func mail(args []string) {
 	flags.Var(ccList, "cc", "comma-separated list of people to CC:")
 
 	flags.Usage = func() {
-		fmt.Fprintf(stderr(), "Usage: %s mail %s [-r reviewer,...] [-cc mail,...] [commit-hash]\n", os.Args[0], globalFlags)
+		fmt.Fprintf(stderr(), "Usage: %s mail %s [-r reviewer,...] [-cc mail,...] [-topic topic] [commit-hash]\n", os.Args[0], globalFlags)
 	}
 	flags.Parse(args)
 	if len(flags.Args()) > 1 {
@@ -61,6 +62,16 @@ func mail(args []string) {
 	}
 	if *ccList != "" {
 		refSpec += mailList(start, "cc", string(*ccList))
+		start = ","
+	}
+	if *topic != "" {
+		// There's no way to escape the topic, but the only
+		// ambiguous character is ',' (though other characters
+		// like ' ' will be rejected outright by git).
+		if strings.Contains(*topic, ",") {
+			dief("topic may not contain a comma")
+		}
+		refSpec += start + "topic=" + *topic
 	}
 	run("git", "push", "-q", "origin", refSpec)
 
@@ -75,7 +86,7 @@ func mail(args []string) {
 	// There is no conflict with the branch names people are using
 	// for work, because git change rejects any name containing a dot.
 	// The space of names with dots is ours (the Go team's) to define.
-	run("git", "tag", "-f", b.Name+".mailed")
+	run("git", "tag", "-f", b.Name+".mailed", c.ShortHash)
 }
 
 // PushSpec returns the spec for a Gerrit push command to publish the change c in b.
@@ -172,7 +183,7 @@ func loadReviewers() {
 		return
 	}
 	countByAddr := map[string]int{}
-	for _, line := range getLines("git", "log", "--format=format:%B") {
+	for _, line := range nonBlankLines(cmdOutput("git", "log", "--format=format:%B")) {
 		if strings.HasPrefix(line, "Reviewed-by:") {
 			f := strings.Fields(line)
 			addr := f[len(f)-1]

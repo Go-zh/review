@@ -32,6 +32,7 @@ aliases in their .gitconfig file:
 		gofmt = codereview gofmt
 		mail = codereview mail
 		pending = codereview pending
+		rebase-work = codereview rebase-work
 		submit = codereview submit
 		sync = codereview sync
 
@@ -50,7 +51,8 @@ Branchpoint
 The branchpoint command prints the commit hash of the most recent change
 on the current branch that is shared with the Gerrit server. This is the point
 where local work branched from the published tree. The command is intended
-mainly for use in scripts. For example, "git rebase -i $(git codereview branchpoint)".
+mainly for use in scripts. For example, "git diff $(git codereview branchpoint)"
+or "git log $(git codereview branchpoint)..HEAD".
 
 Change
 
@@ -106,8 +108,8 @@ not present. It also checks that the message uses the convention established by
 the Go project that the first line has the form, pkg/path: summary.
 
 The hooks command will not overwrite an existing hook.
-If it is not installing hooks, use 'git review hooks -v' for details.
-This hook installation is also done at startup by all other git review
+If it is not installing hooks, use 'git codereview hooks -v' for details.
+This hook installation is also done at startup by all other git codereview
 commands, except 'help'.
 
 Hook-Invoke
@@ -116,7 +118,7 @@ The hook-invoke command is an internal command that invokes the named Git hook.
 
 	git codereview hook-invoke <hook> [args]
 
-It is run by the shell scripts installed by the "git review hooks" command.
+It is run by the shell scripts installed by the "git codereview hooks" command.
 
 Mail
 
@@ -156,6 +158,14 @@ The -l flag causes the command to use only locally available information.
 By default, it fetches recent commits and code review information from the
 Gerrit server.
 
+Rebase-work
+
+The rebase-work command runs git rebase in interactive mode over pending changes.
+It is shorthand for "git rebase -i $(git codereview branchpoint)".
+It differs from plain "git rebase -i" in that the latter will try to incorporate
+new commits from the origin branch during the rebase, and git rebase-work
+does not.
+
 Submit
 
 The submit command pushes the pending change to the Gerrit server and tells
@@ -168,7 +178,7 @@ part of the pending change.
 
 After submitting the change, the change command tries to synchronize the
 current branch to the submitted commit, if it can do so cleanly.
-If not, it will prompt the user to run 'git review sync' manually.
+If not, it will prompt the user to run 'git codereview sync' manually.
 
 After a successful sync, the branch can be used to prepare a new change.
 

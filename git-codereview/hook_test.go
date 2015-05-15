@@ -14,6 +14,8 @@ import (
 	"testing"
 )
 
+const lenChangeId = len("\n\nChange-Id: I") + 2*20
+
 func TestHookCommitMsg(t *testing.T) {
 	gt := newGitTest(t)
 	defer gt.done()
@@ -21,31 +23,111 @@ func TestHookCommitMsg(t *testing.T) {
 	// Check that hook adds Change-Id.
 	write(t, gt.client+"/msg.txt", "Test message.\n")
 	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
-	data, err := ioutil.ReadFile(gt.client + "/msg.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := read(t, gt.client+"/msg.txt")
 	if !bytes.Contains(data, []byte("\n\nChange-Id: ")) {
 		t.Fatalf("after hook-invoke commit-msg, missing Change-Id:\n%s", data)
 	}
 
 	// Check that hook is no-op when Change-Id is already present.
 	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
-	data1, err := ioutil.ReadFile(gt.client + "/msg.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
+	data1 := read(t, gt.client+"/msg.txt")
 	if !bytes.Equal(data, data1) {
 		t.Fatalf("second hook-invoke commit-msg changed Change-Id:\nbefore:\n%s\n\nafter:\n%s", data, data1)
+	}
+
+	// Check that hook rejects multiple Change-Ids.
+	write(t, gt.client+"/msgdouble.txt", string(data)+string(data))
+	testMainDied(t, "hook-invoke", "commit-msg", gt.client+"/msgdouble.txt")
+	const multiple = "git-codereview: multiple Change-Id lines\n"
+	if got := testStderr.String(); got != multiple {
+		t.Fatalf("unexpected output:\ngot: %q\nwant: %q", got, multiple)
 	}
 
 	// Check that hook fails when message is empty.
 	write(t, gt.client+"/empty.txt", "\n\n# just a file with\n# comments\n")
 	testMainDied(t, "hook-invoke", "commit-msg", gt.client+"/empty.txt")
-	const want = "git-codereview: empty commit message\n"
-	if got := testStderr.String(); got != want {
-		t.Fatalf("unexpected output:\ngot: %q\nwant: %q", got, want)
+	const empty = "git-codereview: empty commit message\n"
+	if got := testStderr.String(); got != empty {
+		t.Fatalf("unexpected output:\ngot: %q\nwant: %q", got, empty)
 	}
+
+	// Check that hook inserts a blank line after the first line as needed.
+	rewrites := []struct {
+		in   string
+		want string
+	}{
+		{in: "all: gofmt", want: "all: gofmt"},
+		{in: "all: gofmt\n", want: "all: gofmt\n"},
+		{in: "all: gofmt\nahhh", want: "all: gofmt\n\nahhh"},
+		{in: "all: gofmt\n\nahhh", want: "all: gofmt\n\nahhh"},
+		{in: "all: gofmt\n\n\nahhh", want: "all: gofmt\n\n\nahhh"},
+	}
+	for _, tt := range rewrites {
+		write(t, gt.client+"/in.txt", tt.in)
+		testMain(t, "hook-invoke", "commit-msg", gt.client+"/in.txt")
+		write(t, gt.client+"/want.txt", tt.want)
+		testMain(t, "hook-invoke", "commit-msg", gt.client+"/want.txt")
+		got, err := ioutil.ReadFile(gt.client + "/in.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := ioutil.ReadFile(gt.client + "/want.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// pull off the Change-Id that got appended
+		got = got[:len(got)-lenChangeId]
+		want = want[:len(want)-lenChangeId]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("failed to rewrite:\n%s\n\ngot:\n\n%s\n\nwant:\n\n%s\n", tt.in, got, want)
+		}
+	}
+}
+
+func TestHookCommitMsgIssueRepoRewrite(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	// If there's no config, don't rewrite issue references.
+	const msg = "math/big: catch all the rats\n\nFixes #99999, at least for now\n"
+	write(t, gt.client+"/msg.txt", msg)
+	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
+	got, err := ioutil.ReadFile(gt.client + "/msg.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = got[:len(got)-lenChangeId]
+	if string(got) != msg {
+		t.Errorf("hook changed %s to %s", msg, got)
+	}
+
+	// Add issuerepo config.
+	write(t, gt.client+"/codereview.cfg", "issuerepo: golang/go")
+	trun(t, gt.client, "git", "add", "codereview.cfg")
+	trun(t, gt.client, "git", "commit", "-m", "add issuerepo codereview config")
+
+	// Look in master rather than origin/master for the config
+	savedConfigRef := configRef
+	configRef = "master:codereview.cfg"
+	cachedConfig = nil
+
+	// Check for the rewrite
+	write(t, gt.client+"/msg.txt", msg)
+	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
+	got, err = ioutil.ReadFile(gt.client + "/msg.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = got[:len(got)-lenChangeId]
+	const want = "math/big: catch all the rats\n\nFixes golang/go#99999, at least for now\n"
+	if string(got) != want {
+		t.Errorf("issue rewrite failed: got\n\n%s\nwant\n\n%s", got, want)
+	}
+
+	// Reset config state
+	configRef = savedConfigRef
+	cachedConfig = nil
 }
 
 func TestHookCommitMsgBranchPrefix(t *testing.T) {
@@ -62,25 +144,40 @@ func TestHookCommitMsgBranchPrefix(t *testing.T) {
 		if !bytes.HasPrefix(data, []byte(prefix)) {
 			t.Errorf("after hook-invoke commit-msg on %s, want prefix %q:\n%s", CurrentBranch().Name, prefix, data)
 		}
+
+		if i := strings.Index(prefix, "]"); i >= 0 {
+			prefix := prefix[:i+1]
+			for _, magic := range []string{"fixup!", "squash!"} {
+				write(t, gt.client+"/msg.txt", magic+" Test message.\n")
+				testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
+				data, err := ioutil.ReadFile(gt.client + "/msg.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.HasPrefix(data, []byte(prefix)) {
+					t.Errorf("after hook-invoke commit-msg on %s with %s, found incorrect prefix %q:\n%s", CurrentBranch().Name, magic, prefix, data)
+				}
+			}
+		}
 	}
 
 	// Create server branch and switch to server branch on client.
 	// Test that commit hook adds prefix.
 	trun(t, gt.server, "git", "checkout", "-b", "dev.cc")
 	trun(t, gt.client, "git", "fetch", "-q")
-	trun(t, gt.client, "git", "change", "dev.cc")
+	testMain(t, "change", "dev.cc")
 	checkPrefix("[dev.cc] Test message.\n")
 
 	// Work branch with server branch as upstream.
-	trun(t, gt.client, "git", "change", "ccwork")
+	testMain(t, "change", "ccwork")
 	checkPrefix("[dev.cc] Test message.\n")
 
 	// Master has no prefix.
-	trun(t, gt.client, "git", "change", "master")
+	testMain(t, "change", "master")
 	checkPrefix("Test message.\n")
 
 	// Work branch from master has no prefix.
-	trun(t, gt.client, "git", "change", "work")
+	testMain(t, "change", "work")
 	checkPrefix("Test message.\n")
 }
 

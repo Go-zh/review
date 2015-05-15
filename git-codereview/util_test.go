@@ -20,11 +20,13 @@ import (
 )
 
 type gitTest struct {
-	pwd    string // current directory before test
-	tmpdir string // temporary directory holding repos
-	server string // server repo root
-	client string // client repo root
-	nwork  int    // number of calls to work method
+	pwd         string // current directory before test
+	tmpdir      string // temporary directory holding repos
+	server      string // server repo root
+	client      string // client repo root
+	nwork       int    // number of calls to work method
+	nworkServer int    // number of calls to serverWork method
+	nworkOther  int    // number of calls to serverWorkUnrelated method
 }
 
 // resetReadOnlyFlagAll resets windows read-only flag
@@ -60,24 +62,56 @@ func (gt *gitTest) done() {
 	os.RemoveAll(gt.tmpdir)
 }
 
+// doWork simulates commit 'n' touching 'file' in 'dir'
+func doWork(t *testing.T, n int, dir, file, changeid string) {
+	write(t, dir+"/"+file, fmt.Sprintf("new content %d", n))
+	trun(t, dir, "git", "add", file)
+	suffix := ""
+	if n > 1 {
+		suffix = fmt.Sprintf(" #%d", n)
+	}
+	msg := fmt.Sprintf("msg%s\n\nChange-Id: I%d%s\n", suffix, n, changeid)
+	trun(t, dir, "git", "commit", "-m", msg)
+}
+
 func (gt *gitTest) work(t *testing.T) {
 	if gt.nwork == 0 {
 		trun(t, gt.client, "git", "checkout", "-b", "work")
 		trun(t, gt.client, "git", "branch", "--set-upstream-to", "origin/master")
+		trun(t, gt.client, "git", "tag", "work") // make sure commands do the right thing when there is a tag of the same name
 	}
 
 	// make local change on client
 	gt.nwork++
-	write(t, gt.client+"/file", fmt.Sprintf("new content %d", gt.nwork))
-	trun(t, gt.client, "git", "add", "file")
-	trun(t, gt.client, "git", "commit", "-m", fmt.Sprintf("msg\n\nChange-Id: I%d23456789\n", gt.nwork))
+	doWork(t, gt.nwork, gt.client, "file", "23456789")
 }
 
-func newGitTest(t *testing.T) *gitTest {
+func (gt *gitTest) serverWork(t *testing.T) {
+	// make change on server
+	// duplicating the sequence of changes in gt.work to simulate them
+	// having gone through Gerrit and submitted with possibly
+	// different commit hashes but the same content.
+	gt.nworkServer++
+	doWork(t, gt.nworkServer, gt.server, "file", "23456789")
+}
+
+func (gt *gitTest) serverWorkUnrelated(t *testing.T) {
+	// make unrelated change on server
+	// this makes history different on client and server
+	gt.nworkOther++
+	doWork(t, gt.nworkOther, gt.server, "otherfile", "9999")
+}
+
+func newGitTest(t *testing.T) (gt *gitTest) {
 	tmpdir, err := ioutil.TempDir("", "git-codereview-test")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		if gt == nil {
+			os.RemoveAll(tmpdir)
+		}
+	}()
 
 	server := tmpdir + "/git-origin"
 
@@ -125,14 +159,12 @@ func newGitTest(t *testing.T) *gitTest {
 		t.Fatal(err)
 	}
 
-	gt := &gitTest{
+	return &gitTest{
 		pwd:    pwd,
 		tmpdir: tmpdir,
 		server: server,
 		client: client,
 	}
-
-	return gt
 }
 
 func (gt *gitTest) removeStubHooks() {
@@ -147,10 +179,24 @@ func mkdir(t *testing.T, dir string) {
 	}
 }
 
+func chdir(t *testing.T, dir string) {
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func write(t *testing.T, file, data string) {
 	if err := ioutil.WriteFile(file, []byte(data), 0666); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func read(t *testing.T, file string) []byte {
+	b, err := ioutil.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func remove(t *testing.T, file string) {
@@ -169,10 +215,14 @@ func trun(t *testing.T, dir string, cmdline ...string) string {
 	return string(out)
 }
 
-// fromSlash is like filepath.FromSlash, but it ignores ! at the start of the path.
+// fromSlash is like filepath.FromSlash, but it ignores ! at the start of the path
+// and " (staged)" at the end.
 func fromSlash(path string) string {
 	if len(path) > 0 && path[0] == '!' {
-		return "!" + filepath.FromSlash(path[1:])
+		return "!" + fromSlash(path[1:])
+	}
+	if strings.HasSuffix(path, " (staged)") {
+		return fromSlash(path[:len(path)-len(" (staged)")]) + " (staged)"
 	}
 	return filepath.FromSlash(path)
 }

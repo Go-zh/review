@@ -14,7 +14,7 @@ import (
 var changeAuto bool
 var changeQuick bool
 
-func change(args []string) {
+func cmdChange(args []string) {
 	flags.BoolVar(&changeAuto, "a", false, "add changes to any tracked files")
 	flags.BoolVar(&changeQuick, "q", false, "do not edit pending commit msg")
 	flags.Parse(args)
@@ -162,7 +162,7 @@ var (
 )
 
 func commitMessageOK() bool {
-	body := getOutput("git", "log", "--format=format:%B", "-n", "1")
+	body := cmdOutput("git", "log", "--format=format:%B", "-n", "1")
 	ok := true
 	if !messageRE.MatchString(body) {
 		fmt.Print(commitMessageWarning)

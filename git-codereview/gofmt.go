@@ -17,7 +17,7 @@ import (
 
 var gofmtList bool
 
-func gofmt(args []string) {
+func cmdGofmt(args []string) {
 	flags.BoolVar(&gofmtList, "l", false, "list files that need to be formatted")
 	flags.Parse(args)
 	if len(flag.Args()) > 0 {
@@ -60,7 +60,7 @@ const (
 //
 // As a special case for the main repo (but applied everywhere)
 // *.go files under a top-level test directory are excluded from the
-// formatting requirement, except those in test/bench/.
+// formatting requirement, except run.go and those in test/bench/.
 //
 // If gofmtWrite is set (only with gofmtCommand, meaning this is 'git gofmt'),
 // runGofmt replaces the original files with their formatted equivalents.
@@ -120,15 +120,15 @@ func runGofmt(flags int) (files []string, stderrText string) {
 
 	// Find files modified in the index compared to the branchpoint.
 	branchpt := b.Branchpoint()
-	if strings.Contains(getOutput("git", "branch", "-r", "--contains", b.Name), "origin/") {
+	if strings.Contains(cmdOutput("git", "branch", "-r", "--contains", b.FullName()), "origin/") {
 		// This is a branch tag move, not an actual change.
 		// Use HEAD as branch point, so nothing will appear changed.
 		// We don't want to think about gofmt on already published
 		// commits.
 		branchpt = "HEAD"
 	}
-	indexFiles := addRoot(repo, filter(gofmtRequired, getLines("git", "diff", "--name-only", "--diff-filter=ACM", "--cached", branchpt, "--")))
-	localFiles := addRoot(repo, filter(gofmtRequired, getLines("git", "diff", "--name-only", "--diff-filter=ACM")))
+	indexFiles := addRoot(repo, filter(gofmtRequired, nonBlankLines(cmdOutput("git", "diff", "--name-only", "--diff-filter=ACM", "--cached", branchpt, "--"))))
+	localFiles := addRoot(repo, filter(gofmtRequired, nonBlankLines(cmdOutput("git", "diff", "--name-only", "--diff-filter=ACM"))))
 	localFilesMap := stringMap(localFiles)
 	isUnstaged := func(file string) bool {
 		return localFilesMap[file]
@@ -203,14 +203,18 @@ func runGofmt(flags int) (files []string, stderrText string) {
 			}
 			args := []string{"checkout-index", "--temp", "--"}
 			args = append(args, needTemp[:n]...)
-			for _, line := range getLines("git", args...) {
+			// Until Git 2.3.0, git checkout-index --temp is broken if not run in the repo root.
+			// Work around by running in the repo root.
+			// http://article.gmane.org/gmane.comp.version-control.git/261739
+			// https://github.com/git/git/commit/74c4de5
+			for _, line := range nonBlankLines(cmdOutputDir(repo, "git", args...)) {
 				i := strings.Index(line, "\t")
 				if i < 0 {
 					continue
 				}
 				temp, file := line[:i], line[i+1:]
 				temp = filepath.Join(repo, temp)
-				file = filepath.Join(pwd, file)
+				file = filepath.Join(repo, file)
 				tempToFile[temp] = file
 				fileToTemp[file] = temp
 			}
@@ -266,10 +270,7 @@ func runGofmt(flags int) (files []string, stderrText string) {
 	}
 
 	// Build file list.
-	files = strings.Split(stdout.String(), "\n")
-	if len(files) > 0 && files[len(files)-1] == "" {
-		files = files[:len(files)-1]
-	}
+	files = lines(stdout.String())
 
 	// Restage files that need to be restaged.
 	if flags&gofmtWrite != 0 {
@@ -288,7 +289,7 @@ func runGofmt(flags int) (files []string, stderrText string) {
 			run("git", add...)
 		}
 		if len(updateIndex) > 0 {
-			hashes := getLines("git", write...)
+			hashes := nonBlankLines(cmdOutput("git", write...))
 			if len(hashes) != len(write)-3 {
 				dief("git hash-object -w did not write expected number of objects")
 			}
@@ -340,8 +341,14 @@ func runGofmt(flags int) (files []string, stderrText string) {
 // for gofmt'dness by the pre-commit hook.
 // The file name is relative to the repo root.
 func gofmtRequired(file string) bool {
-	return strings.HasSuffix(file, ".go") &&
-		!(strings.HasPrefix(file, "test/") && !strings.HasPrefix(file, "test/bench/"))
+	// TODO: Consider putting this policy into codereview.cfg.
+	if !strings.HasSuffix(file, ".go") {
+		return false
+	}
+	if !strings.HasPrefix(file, "test/") {
+		return true
+	}
+	return strings.HasPrefix(file, "test/bench/") || file == "test/run.go"
 }
 
 // stringMap returns a map m such that m[s] == true if s was in the original list.
