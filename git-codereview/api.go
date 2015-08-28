@@ -40,10 +40,11 @@ func loadGerritOrigin() {
 		return
 	}
 
-	// Gerrit must be set as Git's origin remote.
+	// Gerrit must be set, either explicitly via the code review config or
+	// implicitly as Git's origin remote.
 	origin, err := getOutputErr("git", "config", "remote.origin.pushurl")
 	if err != nil || origin == "" {
-		origin = getOutput("git", "config", "remote.origin.url")
+		origin = trim(cmdOutput("git", "config", "remote.origin.url"))
 	}
 
 	if strings.Contains(origin, "github.com") {
