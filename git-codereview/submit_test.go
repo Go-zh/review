@@ -5,6 +5,8 @@
 package main
 
 import (
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -162,4 +164,99 @@ func TestSubmit(t *testing.T) {
 	testRan(t,
 		"git fetch -q",
 		"git checkout -q -B work "+serverHead+" --")
+}
+
+func TestSubmitMultiple(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	srv := newGerritServer(t)
+	defer srv.done()
+
+	cl1, cl2 := testSubmitMultiple(t, gt, srv)
+	testMain(t, "submit", cl1.CurrentRevision, cl2.CurrentRevision)
+}
+
+func TestSubmitMultipleNamed(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	srv := newGerritServer(t)
+	defer srv.done()
+
+	_, _ = testSubmitMultiple(t, gt, srv)
+	testMain(t, "submit", "HEAD^", "HEAD")
+}
+
+func TestSubmitInteractive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("see golang.org/issue/13406")
+	}
+
+	gt := newGitTest(t)
+	defer gt.done()
+
+	srv := newGerritServer(t)
+	defer srv.done()
+
+	cl1, cl2 := testSubmitMultiple(t, gt, srv)
+	os.Setenv("GIT_EDITOR", "echo "+cl1.CurrentRevision+" > ")
+	testMain(t, "submit", "-i")
+	if cl1.Status != "MERGED" {
+		t.Fatalf("want cl1.Status == MERGED; got %v", cl1.Status)
+	}
+	if cl2.Status != "NEW" {
+		t.Fatalf("want cl2.Status == NEW; got %v", cl1.Status)
+	}
+}
+
+func testSubmitMultiple(t *testing.T, gt *gitTest, srv *gerritServer) (*GerritChange, *GerritChange) {
+	write(t, gt.client+"/file1", "")
+	trun(t, gt.client, "git", "add", "file1")
+	trun(t, gt.client, "git", "commit", "-m", "msg\n\nChange-Id: I0000001\n")
+	hash1 := strings.TrimSpace(trun(t, gt.client, "git", "log", "-n", "1", "--format=format:%H"))
+
+	write(t, gt.client+"/file2", "")
+	trun(t, gt.client, "git", "add", "file2")
+	trun(t, gt.client, "git", "commit", "-m", "msg\n\nChange-Id: I0000002\n")
+	hash2 := strings.TrimSpace(trun(t, gt.client, "git", "log", "-n", "1", "--format=format:%H"))
+
+	testMainDied(t, "submit")
+	testPrintedStderr(t, "cannot submit: multiple changes pending")
+
+	cl1 := GerritChange{
+		Status:          "NEW",
+		Mergeable:       true,
+		CurrentRevision: hash1,
+		Labels:          map[string]*GerritLabel{"Code-Review": &GerritLabel{Approved: new(GerritAccount)}},
+	}
+	cl2 := GerritChange{
+		Status:          "NEW",
+		Mergeable:       false,
+		CurrentRevision: hash2,
+		Labels:          map[string]*GerritLabel{"Code-Review": &GerritLabel{Approved: new(GerritAccount)}},
+	}
+
+	srv.setReply("/a/changes/proj~master~I0000001", gerritReply{f: func() gerritReply {
+		return gerritReply{json: cl1}
+	}})
+	srv.setReply("/a/changes/proj~master~I0000001/submit", gerritReply{f: func() gerritReply {
+		if cl1.Status != "NEW" {
+			return gerritReply{status: 409}
+		}
+		cl1.Status = "MERGED"
+		cl2.Mergeable = true
+		return gerritReply{json: cl1}
+	}})
+	srv.setReply("/a/changes/proj~master~I0000002", gerritReply{f: func() gerritReply {
+		return gerritReply{json: cl2}
+	}})
+	srv.setReply("/a/changes/proj~master~I0000002/submit", gerritReply{f: func() gerritReply {
+		if cl2.Status != "NEW" || !cl2.Mergeable {
+			return gerritReply{status: 409}
+		}
+		cl2.Status = "MERGED"
+		return gerritReply{json: cl2}
+	}})
+	return &cl1, &cl2
 }
