@@ -13,19 +13,18 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 )
 
-var hookPath = ".git/hooks/"
 var hookFiles = []string{
 	"commit-msg",
 	"pre-commit",
 }
 
 func installHook() {
+	hooksDir := gitPath("hooks")
 	for _, hookFile := range hookFiles {
-		filename := filepath.Join(repoRoot(), hookPath+hookFile)
+		filename := filepath.Join(hooksDir, hookFile)
 		hookContent := fmt.Sprintf(hookScript, hookFile)
 
 		if data, err := ioutil.ReadFile(filename); err == nil {
@@ -70,23 +69,22 @@ func installHook() {
 }
 
 func repoRoot() string {
-	dir, err := os.Getwd()
+	return filepath.Clean(trim(cmdOutput("git", "rev-parse", "--show-toplevel")))
+}
+
+// gitPath resolve the $GIT_DIR/path, taking in consideration
+// all other path relocations, e.g. hooks for linked worktrees
+// are not kept in their gitdir, but shared in the main one.
+func gitPath(path string) string {
+	p, err := trimErr(cmdOutputErr("git", "rev-parse", "--git-path", path))
 	if err != nil {
-		dief("could not get current directory: %v", err)
+		// When --git-path is not available, assume the common case.
+		p = filepath.Join(".git", path)
 	}
-	rootlen := 1
-	if runtime.GOOS == "windows" {
-		rootlen += len(filepath.VolumeName(dir))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(repoRoot(), p)
 	}
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			return dir
-		}
-		if len(dir) == rootlen && dir[rootlen-1] == filepath.Separator {
-			dief("git root not found. Rerun from within the Git tree.")
-		}
-		dir = filepath.Dir(dir)
-	}
+	return p
 }
 
 var hookScript = `#!/bin/sh
@@ -111,7 +109,10 @@ func cmdHookInvoke(args []string) {
 	}
 }
 
-var issueRefRE = regexp.MustCompile(`(?P<space>\s)(?P<ref>#\d+\w)`)
+var (
+	issueRefRE         = regexp.MustCompile(`(?P<space>\s)(?P<ref>#\d+\w)`)
+	oldFixesRETemplate = `Fixes +(issue +(%s)?#?)?(?P<issueNum>[0-9]+)`
+)
 
 // hookCommitMsg is installed as the git commit-msg hook.
 // It adds a Change-Id line to the bottom of the commit message
@@ -121,18 +122,25 @@ func hookCommitMsg(args []string) {
 		dief("usage: git-codereview hook-invoke commit-msg message.txt\n")
 	}
 
-	b := CurrentBranch()
-	if b.DetachedHead() {
-		// Likely executing rebase or some other internal operation.
-		// Probably a mistake to make commit message changes.
-		return
-	}
+	// We used to bail in detached head mode, but it's very common
+	// to be modifying things during git rebase -i and it's annoying
+	// that those new commits made don't get Commit-Msg lines.
+	// Let's try keeping the hook on and see what breaks.
+	/*
+		b := CurrentBranch()
+		if b.DetachedHead() {
+			// Likely executing rebase or some other internal operation.
+			// Probably a mistake to make commit message changes.
+			return
+		}
+	*/
 
 	file := args[0]
-	data, err := ioutil.ReadFile(file)
+	oldData, err := ioutil.ReadFile(file)
 	if err != nil {
 		dief("%v", err)
 	}
+	data := append([]byte{}, oldData...)
 	data = stripComments(data)
 
 	// Empty message not allowed.
@@ -148,47 +156,51 @@ func hookCommitMsg(args []string) {
 		data[eol+1] = '\n'
 	}
 
+	issueRepo := config()["issuerepo"]
 	// Update issue references to point to issue repo, if set.
-	if issueRepo := config()["issuerepo"]; issueRepo != "" {
+	if issueRepo != "" {
 		data = issueRefRE.ReplaceAll(data, []byte("${space}"+issueRepo+"${ref}"))
 	}
+	// TestHookCommitMsgIssueRepoRewrite makes sure the regex is valid
+	oldFixesRE := regexp.MustCompile(fmt.Sprintf(oldFixesRETemplate, regexp.QuoteMeta(issueRepo)))
+	data = oldFixesRE.ReplaceAll(data, []byte("Fixes "+issueRepo+"#${issueNum}"))
 
-	// Complain if two Change-Ids are present.
-	// This can happen during an interactive rebase;
-	// it is easy to forget to remove one of them.
-	nChangeId := bytes.Count(data, []byte("\nChange-Id: "))
-	if nChangeId > 1 {
-		dief("multiple Change-Id lines")
-	}
-
-	// Add Change-Id to commit message if not present.
-	edited := false
-	if nChangeId == 0 {
-		edited = true
-		n := len(data)
-		for n > 0 && data[n-1] == '\n' {
-			n--
+	if haveGerrit() {
+		// Complain if two Change-Ids are present.
+		// This can happen during an interactive rebase;
+		// it is easy to forget to remove one of them.
+		nChangeId := bytes.Count(data, []byte("\nChange-Id: "))
+		if nChangeId > 1 {
+			dief("multiple Change-Id lines")
 		}
-		var id [20]byte
-		if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
-			dief("generating Change-Id: %v", err)
-		}
-		data = append(data[:n], fmt.Sprintf("\n\nChange-Id: I%x\n", id[:])...)
-	}
 
-	// Add branch prefix to commit message if not present and not on master
-	// and not a special Git fixup! or squash! commit message.
-	branch := strings.TrimPrefix(b.OriginBranch(), "origin/")
-	if branch != "master" {
-		prefix := "[" + branch + "] "
-		if !bytes.HasPrefix(data, []byte(prefix)) && !isFixup(data) {
-			edited = true
-			data = []byte(prefix + string(data))
+		// Add Change-Id to commit message if not present.
+		if nChangeId == 0 {
+			n := len(data)
+			for n > 0 && data[n-1] == '\n' {
+				n--
+			}
+			var id [20]byte
+			if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
+				dief("generating Change-Id: %v", err)
+			}
+			data = append(data[:n], fmt.Sprintf("\n\nChange-Id: I%x\n", id[:])...)
+		}
+
+		// Add branch prefix to commit message if not present and not on master
+		// and not a special Git fixup! or squash! commit message.
+		b := CurrentBranch()
+		branch := strings.TrimPrefix(b.OriginBranch(), "origin/")
+		if strings.HasPrefix(branch, "dev.") {
+			prefix := "[" + branch + "] "
+			if !bytes.HasPrefix(data, []byte(prefix)) && !isFixup(data) {
+				data = []byte(prefix + string(data))
+			}
 		}
 	}
 
 	// Write back.
-	if edited {
+	if !bytes.Equal(data, oldData) {
 		if err := ioutil.WriteFile(file, data, 0666); err != nil {
 			dief("%v", err)
 		}
@@ -217,15 +229,25 @@ func stripComments(in []byte) []byte {
 // the change are gofmt'd, and if not it prints gofmt instructions
 // and exits with nonzero status.
 func hookPreCommit(args []string) {
-	// Prevent commits to master branches.
-	b := CurrentBranch()
-	if b.DetachedHead() {
-		// This is an internal commit such as during git rebase.
-		// Don't die, and don't force gofmt.
-		return
-	}
-	if !b.IsLocalOnly() {
-		dief("cannot commit on %s branch", b.Name)
+	// We used to bail in detached head mode, but it's very common
+	// to be modifying things during git rebase -i and it's annoying
+	// that those new commits made don't get the gofmt check.
+	// Let's try keeping the hook on and see what breaks.
+	/*
+		b := CurrentBranch()
+		if b.DetachedHead() {
+			// This is an internal commit such as during git rebase.
+			// Don't die, and don't force gofmt.
+			return
+		}
+	*/
+
+	// Prevent commits to master branches, but only if we're here for code review.
+	if haveGerrit() {
+		b := CurrentBranch()
+		if !b.IsLocalOnly() && b.Name != "HEAD" {
+			dief("cannot commit on %s branch", b.Name)
+		}
 	}
 
 	hookGofmt()
@@ -233,7 +255,7 @@ func hookPreCommit(args []string) {
 
 func hookGofmt() {
 	if os.Getenv("GIT_GOFMT_HOOK") == "off" {
-		fmt.Fprintf(stderr(), "git-gofmt-hook disabled by $GIT_GOFMT_HOOK=off\n")
+		fmt.Fprintf(stderr(), "git-codereview pre-commit gofmt hook disabled by $GIT_GOFMT_HOOK=off\n")
 		return
 	}
 

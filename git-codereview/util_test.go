@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -18,6 +19,8 @@ import (
 	"sync"
 	"testing"
 )
+
+var gitversion = "unknown git version" // git version for error logs
 
 type gitTest struct {
 	pwd         string // current directory before test
@@ -60,6 +63,7 @@ func (gt *gitTest) done() {
 	os.Chdir(gt.pwd) // change out of gt.tmpdir first, otherwise following os.RemoveAll fails on windows
 	resetReadOnlyFlagAll(gt.tmpdir)
 	os.RemoveAll(gt.tmpdir)
+	cachedConfig = nil
 }
 
 // doWork simulates commit 'n' touching 'file' in 'dir'
@@ -121,6 +125,8 @@ func newGitTest(t *testing.T) (gt *gitTest) {
 		}
 	}()
 
+	gitversion = trun(t, tmpdir, "git", "--version")
+
 	server := tmpdir + "/git-origin"
 
 	mkdir(t, server)
@@ -175,6 +181,13 @@ func newGitTest(t *testing.T) (gt *gitTest) {
 	}
 }
 
+func (gt *gitTest) enableGerrit(t *testing.T) {
+	write(t, gt.server+"/codereview.cfg", "gerrit: myserver\n")
+	trun(t, gt.server, "git", "add", "codereview.cfg")
+	trun(t, gt.server, "git", "commit", "-m", "add gerrit")
+	trun(t, gt.client, "git", "pull", "-r")
+}
+
 func (gt *gitTest) removeStubHooks() {
 	for _, h := range hookFiles {
 		os.RemoveAll(gt.client + "/.git/hooks/" + h)
@@ -218,6 +231,9 @@ func trun(t *testing.T, dir string, cmdline ...string) string {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if cmdline[0] == "git" {
+			t.Fatalf("in %s/, ran %s with %s:\n%v\n%s", filepath.Base(dir), cmdline, gitversion, err, out)
+		}
 		t.Fatalf("in %s/, ran %s: %v\n%s", filepath.Base(dir), cmdline, err, out)
 	}
 	return string(out)
@@ -260,6 +276,7 @@ func testMainCanDie(t *testing.T, args ...string) {
 func testMain(t *testing.T, args ...string) {
 	*noRun = false
 	*verbose = 0
+	cachedConfig = nil
 
 	t.Logf("git-codereview %s", strings.Join(args, " "))
 
@@ -386,6 +403,7 @@ func (s *gerritServer) done() {
 type gerritReply struct {
 	status int
 	body   string
+	json   interface{}
 	f      func() gerritReply
 }
 
@@ -412,6 +430,13 @@ func (s *gerritServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if reply.status != 0 {
 		w.WriteHeader(reply.status)
+	}
+	if reply.json != nil {
+		body, err := json.Marshal(reply.json)
+		if err != nil {
+			dief("%v", err)
+		}
+		reply.body = ")]}'\n" + string(body)
 	}
 	if len(reply.body) > 0 {
 		w.Write([]byte(reply.body))

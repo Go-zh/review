@@ -17,6 +17,7 @@ func cmdMail(args []string) {
 		diff   = flags.Bool("diff", false, "show change commit diff and don't upload or mail")
 		force  = flags.Bool("f", false, "mail even if there are staged changes")
 		topic  = flags.String("topic", "", "set Gerrit topic")
+		trybot = flags.Bool("trybot", false, "run trybots on the uploaded CLs")
 		rList  = new(stringList) // installed below
 		ccList = new(stringList) // installed below
 	)
@@ -24,7 +25,7 @@ func cmdMail(args []string) {
 	flags.Var(ccList, "cc", "comma-separated list of people to CC:")
 
 	flags.Usage = func() {
-		fmt.Fprintf(stderr(), "Usage: %s mail %s [-r reviewer,...] [-cc mail,...] [-topic topic] [commit-hash]\n", os.Args[0], globalFlags)
+		fmt.Fprintf(stderr(), "Usage: %s mail %s [-r reviewer,...] [-cc mail,...] [-topic topic] [-trybot] [commit]\n", os.Args[0], globalFlags)
 	}
 	flags.Parse(args)
 	if len(flags.Args()) > 1 {
@@ -36,7 +37,7 @@ func cmdMail(args []string) {
 
 	var c *Commit
 	if len(flags.Args()) == 1 {
-		c = b.CommitByHash("mail", flags.Arg(0))
+		c = b.CommitByRev("mail", flags.Arg(0))
 	} else {
 		c = b.DefaultCommit("mail")
 	}
@@ -44,6 +45,10 @@ func cmdMail(args []string) {
 	if *diff {
 		run("git", "diff", b.Branchpoint()[:7]+".."+c.ShortHash, "--")
 		return
+	}
+
+	if len(ListFiles(c)) == 0 {
+		dief("cannot mail: commit %s is empty", c.ShortHash)
 	}
 
 	if !*force && HasStagedChanges() {
@@ -72,6 +77,11 @@ func cmdMail(args []string) {
 			dief("topic may not contain a comma")
 		}
 		refSpec += start + "topic=" + *topic
+		start = ","
+	}
+	if *trybot {
+		refSpec += start + "l=Run-TryBot"
+		start = ","
 	}
 	run("git", "push", "-q", "origin", refSpec)
 

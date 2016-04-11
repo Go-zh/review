@@ -54,6 +54,35 @@ func TestMailAmbiguousRevision(t *testing.T) {
 	testMain(t, "mail", "-diff")
 }
 
+func TestMailMultiple(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	srv := newGerritServer(t)
+	defer srv.done()
+
+	gt.work(t)
+	gt.work(t)
+	gt.work(t)
+
+	testMainDied(t, "mail")
+	testPrintedStderr(t, "cannot mail: multiple changes pending")
+
+	// Mail first two and test non-HEAD mail.
+	h := CurrentBranch().Pending()[1].ShortHash
+	testMain(t, "mail", "HEAD^")
+	testRan(t,
+		"git push -q origin "+h+":refs/for/master",
+		"git tag -f work.mailed "+h)
+
+	// Mail HEAD.
+	h = CurrentBranch().Pending()[0].ShortHash
+	testMain(t, "mail", "HEAD")
+	testRan(t,
+		"git push -q origin HEAD:refs/for/master",
+		"git tag -f work.mailed "+h)
+}
+
 var reviewerLog = []string{
 	"Fake 1 <r1@fake.com>",
 	"Fake 1 <r1@fake.com>",
@@ -132,4 +161,31 @@ func TestMailTopic(t *testing.T) {
 	testRan(t,
 		"git push -q origin HEAD:refs/for/master%topic=test-topic",
 		"git tag -f work.mailed "+h)
+}
+
+func TestMailEmpty(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	// fake auth information to avoid Gerrit error
+	auth.host = "gerrit.fake"
+	auth.user = "not-a-user"
+	defer func() {
+		auth.host = ""
+		auth.user = ""
+	}()
+
+	testMain(t, "change", "work")
+	testRan(t, "git checkout -q -b work",
+		"git branch -q --set-upstream-to origin/master")
+
+	t.Logf("creating empty change")
+	testCommitMsg = "foo: this commit will be empty"
+	testMain(t, "change")
+	testRan(t, "git commit -q --allow-empty -m foo: this commit will be empty")
+
+	h := CurrentBranch().Pending()[0].ShortHash
+
+	testMainDied(t, "mail")
+	testPrintedStderr(t, "cannot mail: commit "+h+" is empty")
 }

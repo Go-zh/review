@@ -184,7 +184,7 @@ func (b *Branch) loadPending() {
 		}
 	}
 	b.commitsAhead = len(b.pending)
-	b.commitsBehind = len(trim(cmdOutput("git", "log", "--format=format:x", b.FullName()+".."+b.OriginBranch(), "--")))
+	b.commitsBehind = len(lines(cmdOutput("git", "log", "--format=format:x", b.FullName()+".."+b.OriginBranch(), "--")))
 }
 
 // Submitted reports whether some form of b's pending commit
@@ -307,22 +307,24 @@ func (b *Branch) GerritChange(c *Commit, extra ...string) (*GerritChange, error)
 	return readGerritChange(id)
 }
 
-const minHashLen = 4 // git minimum hash length accepted on command line
-
-// CommitByHash finds a unique pending commit by its hash prefix.
-// It dies if the hash cannot be resolved to a pending commit,
-// using the action ("mail", "submit") in the failure message.
-func (b *Branch) CommitByHash(action, hash string) *Commit {
-	if len(hash) < minHashLen {
-		dief("cannot %s: commit hash %q must be at least %d digits long", action, hash, minHashLen)
+// CommitByRev finds a unique pending commit by its git <rev>.
+// It dies if rev cannot be resolved to a commit or that commit is not
+// pending on b using the action ("mail", "submit") in the failure message.
+func (b *Branch) CommitByRev(action, rev string) *Commit {
+	// Parse rev to a commit hash.
+	hash, err := cmdOutputErr("git", "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil {
+		msg := strings.TrimPrefix(trim(err.Error()), "fatal: ")
+		dief("cannot %s: %s", action, msg)
 	}
+	hash = trim(hash)
+
+	// Check that hash is a pending commit.
 	var c *Commit
 	for _, c1 := range b.Pending() {
-		if strings.HasPrefix(c1.Hash, hash) {
-			if c != nil {
-				dief("cannot %s: commit hash %q is ambiguous in the current branch", action, hash)
-			}
+		if c1.Hash == hash {
 			c = c1
+			break
 		}
 	}
 	if c == nil {
@@ -344,9 +346,18 @@ func (b *Branch) DefaultCommit(action string) *Commit {
 		for _, c := range work {
 			fmt.Fprintf(&buf, "\n\t%s %s", c.ShortHash, c.Subject)
 		}
-		dief("cannot %s: multiple changes pending; must specify commit hash on command line:%s", action, buf.String())
+		extra := ""
+		if action == "submit" {
+			extra = " or use submit -i"
+		}
+		dief("cannot %s: multiple changes pending; must specify commit on command line%s:%s", action, extra, buf.String())
 	}
 	return work[0]
+}
+
+// ListFiles returns the list of files in a given commit.
+func ListFiles(c *Commit) []string {
+	return nonBlankLines(cmdOutput("git", "diff", "--name-only", c.Parent, c.Hash, "--"))
 }
 
 func cmdBranchpoint(args []string) {

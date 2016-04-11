@@ -10,14 +10,14 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-const lenChangeId = len("\n\nChange-Id: I") + 2*20
-
-func TestHookCommitMsg(t *testing.T) {
+func TestHookCommitMsgGerrit(t *testing.T) {
 	gt := newGitTest(t)
+	gt.enableGerrit(t)
 	defer gt.done()
 
 	// Check that hook adds Change-Id.
@@ -42,6 +42,11 @@ func TestHookCommitMsg(t *testing.T) {
 	if got := testStderr.String(); got != multiple {
 		t.Fatalf("unexpected output:\ngot: %q\nwant: %q", got, multiple)
 	}
+}
+
+func TestHookCommitMsg(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
 
 	// Check that hook fails when message is empty.
 	write(t, gt.client+"/empty.txt", "\n\n# just a file with\n# comments\n")
@@ -76,9 +81,6 @@ func TestHookCommitMsg(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// pull off the Change-Id that got appended
-		got = got[:len(got)-lenChangeId]
-		want = want[:len(want)-lenChangeId]
 		if !bytes.Equal(got, want) {
 			t.Fatalf("failed to rewrite:\n%s\n\ngot:\n\n%s\n\nwant:\n\n%s\n", tt.in, got, want)
 		}
@@ -89,17 +91,22 @@ func TestHookCommitMsgIssueRepoRewrite(t *testing.T) {
 	gt := newGitTest(t)
 	defer gt.done()
 
-	// If there's no config, don't rewrite issue references.
-	const msg = "math/big: catch all the rats\n\nFixes #99999, at least for now\n"
-	write(t, gt.client+"/msg.txt", msg)
-	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
-	got, err := ioutil.ReadFile(gt.client + "/msg.txt")
-	if err != nil {
-		t.Fatal(err)
+	msgs := []string{
+		// If there's no config, don't rewrite issue references.
+		"math/big: catch all the rats\n\nFixes #99999, at least for now\n",
+		// Fix the fix-message, even without config
+		"math/big: catch all the rats\n\nFixes issue #99999, at least for now\n",
+		"math/big: catch all the rats\n\nFixes issue 99999, at least for now\n",
+		// Don't forget to write back if Change-Id already exists
 	}
-	got = got[:len(got)-lenChangeId]
-	if string(got) != msg {
-		t.Errorf("hook changed %s to %s", msg, got)
+	for _, msg := range msgs {
+		write(t, gt.client+"/msg.txt", msg)
+		testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
+		got := read(t, gt.client+"/msg.txt")
+		const want = "math/big: catch all the rats\n\nFixes #99999, at least for now\n"
+		if string(got) != want {
+			t.Errorf("issue rewrite failed: got\n\n%s\nwant\n\n%s\nlen %d and %d", got, want, len(got), len(want))
+		}
 	}
 
 	// Add issuerepo config.
@@ -113,16 +120,20 @@ func TestHookCommitMsgIssueRepoRewrite(t *testing.T) {
 	cachedConfig = nil
 
 	// Check for the rewrite
-	write(t, gt.client+"/msg.txt", msg)
-	testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
-	got, err = ioutil.ReadFile(gt.client + "/msg.txt")
-	if err != nil {
-		t.Fatal(err)
+	msgs = []string{
+		"math/big: catch all the rats\n\nFixes #99999, at least for now\n",
+		"math/big: catch all the rats\n\nFixes issue #99999, at least for now\n",
+		"math/big: catch all the rats\n\nFixes issue 99999, at least for now\n",
+		"math/big: catch all the rats\n\nFixes issue golang/go#99999, at least for now\n",
 	}
-	got = got[:len(got)-lenChangeId]
-	const want = "math/big: catch all the rats\n\nFixes golang/go#99999, at least for now\n"
-	if string(got) != want {
-		t.Errorf("issue rewrite failed: got\n\n%s\nwant\n\n%s", got, want)
+	for _, msg := range msgs {
+		write(t, gt.client+"/msg.txt", msg)
+		testMain(t, "hook-invoke", "commit-msg", gt.client+"/msg.txt")
+		got := read(t, gt.client+"/msg.txt")
+		const want = "math/big: catch all the rats\n\nFixes golang/go#99999, at least for now\n"
+		if string(got) != want {
+			t.Errorf("issue rewrite failed: got\n\n%s\nwant\n\n%s", got, want)
+		}
 	}
 
 	// Reset config state
@@ -131,7 +142,17 @@ func TestHookCommitMsgIssueRepoRewrite(t *testing.T) {
 }
 
 func TestHookCommitMsgBranchPrefix(t *testing.T) {
+	testHookCommitMsgBranchPrefix(t, false)
+	testHookCommitMsgBranchPrefix(t, true)
+}
+
+func testHookCommitMsgBranchPrefix(t *testing.T, gerrit bool) {
+	t.Logf("gerrit=%v", gerrit)
+
 	gt := newGitTest(t)
+	if gerrit {
+		gt.enableGerrit(t)
+	}
 	defer gt.done()
 
 	checkPrefix := func(prefix string) {
@@ -166,11 +187,19 @@ func TestHookCommitMsgBranchPrefix(t *testing.T) {
 	trun(t, gt.server, "git", "checkout", "-b", "dev.cc")
 	trun(t, gt.client, "git", "fetch", "-q")
 	testMain(t, "change", "dev.cc")
-	checkPrefix("[dev.cc] Test message.\n")
+	if gerrit {
+		checkPrefix("[dev.cc] Test message.\n")
+	} else {
+		checkPrefix("Test message.\n")
+	}
 
 	// Work branch with server branch as upstream.
 	testMain(t, "change", "ccwork")
-	checkPrefix("[dev.cc] Test message.\n")
+	if gerrit {
+		checkPrefix("[dev.cc] Test message.\n")
+	} else {
+		checkPrefix("Test message.\n")
+	}
 
 	// Master has no prefix.
 	testMain(t, "change", "master")
@@ -258,9 +287,30 @@ func TestHookPreCommitDetachedHead(t *testing.T) {
 	trun(t, gt.client, "git", "add", ".")
 	trun(t, gt.client, "git", "checkout", "HEAD^0")
 
-	testMain(t, "hook-invoke", "pre-commit")
-	testNoStdout(t)
-	testNoStderr(t)
+	testMainDied(t, "hook-invoke", "pre-commit")
+	testPrintedStderr(t, "gofmt needs to format these files (run 'git gofmt'):", "bad.go")
+
+	/*
+		OLD TEST, back when we disabled gofmt in detached head,
+		in case we go back to that:
+
+		// If we're in detached head mode, something special is going on,
+		// like git rebase. We disable the gofmt-checking precommit hook,
+		// since we expect it would just get in the way at that point.
+		// (It also used to crash.)
+
+		gt := newGitTest(t)
+		defer gt.done()
+		gt.work(t)
+
+		write(t, gt.client+"/bad.go", badGo)
+		trun(t, gt.client, "git", "add", ".")
+		trun(t, gt.client, "git", "checkout", "HEAD^0")
+
+		testMain(t, "hook-invoke", "pre-commit")
+		testNoStdout(t)
+		testNoStderr(t)
+	*/
 }
 
 func TestHookPreCommitEnv(t *testing.T) {
@@ -277,7 +327,7 @@ func TestHookPreCommitEnv(t *testing.T) {
 
 	testMain(t, "hook-invoke", "pre-commit")
 	testNoStdout(t)
-	testPrintedStderr(t, "git-gofmt-hook disabled by $GIT_GOFMT_HOOK=off")
+	testPrintedStderr(t, "git-codereview pre-commit gofmt hook disabled by $GIT_GOFMT_HOOK=off")
 }
 
 func TestHookPreCommitUnstaged(t *testing.T) {
@@ -362,6 +412,36 @@ func TestHooks(t *testing.T) {
 	}
 }
 
+var worktreeRE = regexp.MustCompile(`\sworktree\s`)
+
+func mustHaveWorktree(t *testing.T) {
+	commands := trun(t, "", "git", "help", "-a")
+	if !worktreeRE.MatchString(commands) {
+		t.Skip("git doesn't support worktree")
+	}
+}
+
+func TestHooksInWorktree(t *testing.T) {
+	gt := newGitTest(t)
+	defer gt.done()
+
+	mustHaveWorktree(t)
+
+	trun(t, gt.client, "git", "worktree", "add", "../worktree")
+	chdir(t, filepath.Join("..", "worktree"))
+
+	gt.removeStubHooks()
+	testMain(t, "hooks") // install hooks
+
+	data, err := ioutil.ReadFile(gt.client + "/.git/hooks/commit-msg")
+	if err != nil {
+		t.Fatalf("hooks did not write commit-msg hook: %v", err)
+	}
+	if string(data) != "#!/bin/sh\nexec git-codereview hook-invoke commit-msg \"$@\"\n" {
+		t.Fatalf("invalid commit-msg hook:\n%s", string(data))
+	}
+}
+
 func TestHooksOverwriteOldCommitMsg(t *testing.T) {
 	gt := newGitTest(t)
 	defer gt.done()
@@ -394,6 +474,7 @@ func testInstallHook(t *testing.T, gt *gitTest) (restore func()) {
 
 func TestHookCommitMsgFromGit(t *testing.T) {
 	gt := newGitTest(t)
+	gt.enableGerrit(t)
 	defer gt.done()
 
 	restore := testInstallHook(t, gt)
