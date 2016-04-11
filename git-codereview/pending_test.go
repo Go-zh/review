@@ -102,7 +102,7 @@ func TestPendingComplex(t *testing.T) {
 				file
 				file1
 
-		work REVHASH..REVHASH (5 behind)
+		work REVHASH..REVHASH (3 behind)
 		+ REVHASH
 			msg
 			
@@ -152,6 +152,7 @@ func TestPendingComplex(t *testing.T) {
 
 func TestPendingErrors(t *testing.T) {
 	gt := newGitTest(t)
+	gt.enableGerrit(t)
 	defer gt.done()
 
 	trun(t, gt.client, "git", "checkout", "master")

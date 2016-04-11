@@ -5,29 +5,44 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
 // TODO(rsc): Add -tbr, along with standard exceptions (doc/go1.5.txt)
 
 func cmdSubmit(args []string) {
+	var interactive bool
+	flags.BoolVar(&interactive, "i", false, "interactively select commits to submit")
 	flags.Usage = func() {
-		fmt.Fprintf(stderr(), "Usage: %s submit %s [commit-hash]\n", os.Args[0], globalFlags)
+		fmt.Fprintf(stderr(), "Usage: %s submit %s [-i | commit...]\n", os.Args[0], globalFlags)
 	}
 	flags.Parse(args)
-	if n := len(flags.Args()); n > 1 {
+	if interactive && flags.NArg() > 0 {
 		flags.Usage()
 		os.Exit(2)
 	}
 
 	b := CurrentBranch()
-	var c *Commit
-	if len(flags.Args()) == 1 {
-		c = b.CommitByHash("submit", flags.Arg(0))
+	var cs []*Commit
+	if interactive {
+		hashes := submitHashes(b)
+		if len(hashes) == 0 {
+			printf("nothing to submit")
+			return
+		}
+		for _, hash := range hashes {
+			cs = append(cs, b.CommitByRev("submit", hash))
+		}
+	} else if args := flags.Args(); len(args) >= 1 {
+		for _, arg := range args {
+			cs = append(cs, b.CommitByRev("submit", arg))
+		}
 	} else {
-		c = b.DefaultCommit("submit")
+		cs = append(cs, b.DefaultCommit("submit"))
 	}
 
 	// No staged changes.
@@ -37,45 +52,42 @@ func cmdSubmit(args []string) {
 	checkStaged("submit")
 	checkUnstaged("submit")
 
+	// Submit the changes.
+	var g *GerritChange
+	for _, c := range cs {
+		printf("submitting %s %s", c.ShortHash, c.Subject)
+		g = submit(b, c)
+	}
+
+	// Sync client to revision that Gerrit committed, but only if we can do it cleanly.
+	// Otherwise require user to run 'git sync' themselves (if they care).
+	run("git", "fetch", "-q")
+	if len(cs) == 1 && len(b.Pending()) == 1 {
+		if err := runErr("git", "checkout", "-q", "-B", b.Name, g.CurrentRevision, "--"); err != nil {
+			dief("submit succeeded, but cannot sync local branch\n"+
+				"\trun 'git sync' to sync, or\n"+
+				"\trun 'git branch -D %s; git change master; git sync' to discard local branch", b.Name)
+		}
+	} else {
+		printf("submit succeeded; run 'git sync' to sync")
+	}
+
+	// Done! Change is submitted, branch is up to date, ready for new work.
+}
+
+// submit submits a single commit c on branch b and returns the
+// GerritChange for the submitted change. It dies if the submit fails.
+func submit(b *Branch, c *Commit) *GerritChange {
 	// Fetch Gerrit information about this change.
 	g, err := b.GerritChange(c, "LABELS", "CURRENT_REVISION")
 	if err != nil {
 		dief("%v", err)
 	}
 
-	// Check Gerrit change status.
-	switch g.Status {
-	default:
-		dief("cannot submit: unexpected Gerrit change status %q", g.Status)
-
-	case "NEW", "SUBMITTED":
-		// Not yet "MERGED", so try the submit.
-		// "SUBMITTED" is a weird state. It means that Submit has been clicked once,
-		// but it hasn't happened yet, usually because of a merge failure.
-		// The user may have done git sync and may now have a mergable
-		// copy waiting to be uploaded, so continue on as if it were "NEW".
-
-	case "MERGED":
-		// Can happen if moving between different clients.
-		dief("cannot submit: change already submitted, run 'git sync'")
-
-	case "ABANDONED":
-		dief("cannot submit: change abandoned")
-	}
-
-	// Check for label approvals (like CodeReview+2).
-	// The final submit will check these too, but it is better to fail now.
-	for _, name := range g.LabelNames() {
-		label := g.Labels[name]
-		if label.Optional {
-			continue
-		}
-		if label.Rejected != nil {
-			dief("cannot submit: change has %s rejection", name)
-		}
-		if label.Approved == nil {
-			dief("cannot submit: change missing %s approval", name)
-		}
+	// Pre-check that this change appears submittable.
+	// The final submit will check this too, but it is better to fail now.
+	if err = submitCheck(g); err != nil {
+		dief("cannot submit: %v", err)
 	}
 
 	// Upload most recent revision if not already on server.
@@ -97,7 +109,8 @@ func cmdSubmit(args []string) {
 	}
 
 	if *noRun {
-		dief("stopped before submit")
+		printf("stopped before submit")
+		return g
 	}
 
 	// Otherwise, try the submit. Sends back updated GerritChange,
@@ -139,18 +152,101 @@ func cmdSubmit(args []string) {
 		dief("cannot submit: timed out waiting for change to be submitted by Gerrit")
 	}
 
-	// Sync client to revision that Gerrit committed, but only if we can do it cleanly.
-	// Otherwise require user to run 'git sync' themselves (if they care).
-	run("git", "fetch", "-q")
-	if len(b.Pending()) == 1 {
-		if err := runErr("git", "checkout", "-q", "-B", b.Name, g.CurrentRevision, "--"); err != nil {
-			dief("submit succeeded, but cannot sync local branch\n"+
-				"\trun 'git sync' to sync, or\n"+
-				"\trun 'git branch -D %s; git change master; git sync' to discard local branch", b.Name)
-		}
-	} else {
-		printf("submit succeeded; run 'git sync' to sync")
+	return g
+}
+
+// submitCheck checks that g should be submittable. This is
+// necessarily a best-effort check.
+//
+// g must have the "LABELS" option.
+func submitCheck(g *GerritChange) error {
+	// Check Gerrit change status.
+	switch g.Status {
+	default:
+		return fmt.Errorf("unexpected Gerrit change status %q", g.Status)
+
+	case "NEW", "SUBMITTED":
+		// Not yet "MERGED", so try the submit.
+		// "SUBMITTED" is a weird state. It means that Submit has been clicked once,
+		// but it hasn't happened yet, usually because of a merge failure.
+		// The user may have done git sync and may now have a mergable
+		// copy waiting to be uploaded, so continue on as if it were "NEW".
+
+	case "MERGED":
+		// Can happen if moving between different clients.
+		return fmt.Errorf("change already submitted, run 'git sync'")
+
+	case "ABANDONED":
+		return fmt.Errorf("change abandoned")
 	}
 
-	// Done! Change is submitted, branch is up to date, ready for new work.
+	// Check for label approvals (like CodeReview+2).
+	for _, name := range g.LabelNames() {
+		label := g.Labels[name]
+		if label.Optional {
+			continue
+		}
+		if label.Rejected != nil {
+			return fmt.Errorf("change has %s rejection", name)
+		}
+		if label.Approved == nil {
+			return fmt.Errorf("change missing %s approval", name)
+		}
+	}
+
+	return nil
+}
+
+// submitHashes interactively prompts for commits to submit.
+func submitHashes(b *Branch) []string {
+	// Get pending commits on b.
+	pending := b.Pending()
+	for _, c := range pending {
+		// Note that DETAILED_LABELS does not imply LABELS.
+		c.g, c.gerr = b.GerritChange(c, "CURRENT_REVISION", "LABELS", "DETAILED_LABELS")
+		if c.g == nil {
+			c.g = new(GerritChange)
+		}
+	}
+
+	// Construct submit script.
+	var script bytes.Buffer
+	for i := len(pending) - 1; i >= 0; i-- {
+		c := pending[i]
+
+		if c.g.ID == "" {
+			fmt.Fprintf(&script, "# change not on Gerrit:\n#")
+		} else if err := submitCheck(c.g); err != nil {
+			fmt.Fprintf(&script, "# %v:\n#", err)
+		}
+
+		formatCommit(&script, c, true)
+	}
+
+	fmt.Fprintf(&script, `
+# The above commits will be submitted in order from top to bottom
+# when you exit the editor.
+#
+# These lines can be re-ordered, removed, and commented out.
+#
+# If you remove all lines, the submit will be aborted.
+`)
+
+	// Edit the script.
+	final := editor(script.String())
+
+	// Parse the final script.
+	var hashes []string
+	for _, line := range lines(final) {
+		line := strings.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		if i := strings.Index(line, " "); i >= 0 {
+			line = line[:i]
+		}
+		hashes = append(hashes, line)
+	}
+
+	return hashes
 }
